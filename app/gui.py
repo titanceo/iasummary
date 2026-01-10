@@ -65,14 +65,25 @@ class ConverterUI:
         self.current_transcript_path: Optional[Path] = None
         self.current_transcript_content: str = ""
         self.list_frame: Optional[ttk.LabelFrame] = None
+        self.analysis_links: Dict[str, Tuple[Path, float]] = {}
+        self.analysis_input: Optional[tk.Text] = None
+        self.analysis_output: Optional[tk.Text] = None
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        self._build_menu()
         self._build_ui()
         self._init_vlc()
         self._refresh_transcripts()
         self.search_var.trace_add("write", self._on_search_change)
         self.transcript_search_var.trace_add("write", self._on_transcript_search_change)
+
+    def _build_menu(self) -> None:
+        menubar = tk.Menu(self.root)
+        settings_menu = tk.Menu(menubar, tearoff=0)
+        settings_menu.add_command(label="Configuracion...", command=self._open_settings_window)
+        menubar.add_cascade(label="Configuracion", menu=settings_menu)
+        self.root.config(menu=menubar)
 
     def _build_ui(self) -> None:
         paned = ttk.PanedWindow(self.root, orient="horizontal")
@@ -136,9 +147,9 @@ class ConverterUI:
         notebook.pack(fill="both", expand=True, padx=10, pady=10)
 
         transcript_tab = ttk.Frame(notebook)
-        chat_tab = ttk.Frame(notebook)
+        analysis_tab = ttk.Frame(notebook)
         notebook.add(transcript_tab, text="Transcripcion")
-        notebook.add(chat_tab, text="Chat")
+        notebook.add(analysis_tab, text="Analisis")
 
         transcript_controls = ttk.Frame(transcript_tab)
         transcript_controls.pack(fill="x", pady=(6, 0))
@@ -156,17 +167,36 @@ class ConverterUI:
         self.transcript_text.pack(fill="both", expand=True, pady=(6, 0))
         self.transcript_search_var.trace_add("write", self._on_transcript_search_change)
 
-        chat_paned = ttk.PanedWindow(chat_tab, orient="vertical")
-        chat_paned.pack(fill="both", expand=True)
-        chat_top = ttk.Frame(chat_paned)
-        chat_bottom = ttk.Frame(chat_paned)
-        chat_paned.add(chat_top, weight=4)
-        chat_paned.add(chat_bottom, weight=1)
+        analysis_controls = ttk.Frame(analysis_tab, padding=10)
+        analysis_controls.pack(fill="x")
+        ttk.Button(
+            analysis_controls, text="Generar TXT", command=self._generate_analysis_txt
+        ).pack(side="left")
+        ttk.Button(
+            analysis_controls, text="Ver prompt", command=self._show_analysis_prompt
+        ).pack(side="left", padx=(6, 0))
+        ttk.Label(
+            analysis_controls,
+            text="Pega la respuesta de ChatGPT y luego procesa para activar enlaces.",
+        ).pack(side="left", padx=(8, 0))
 
-        self.chat_text = tk.Text(chat_top, state="disabled", wrap="word")
-        self.chat_text.pack(fill="both", expand=True)
-        self.chat_input = tk.Text(chat_bottom, height=4, wrap="word")
-        self.chat_input.pack(fill="both", expand=True)
+        analysis_paned = ttk.PanedWindow(analysis_tab, orient="vertical")
+        analysis_paned.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        analysis_top = ttk.Frame(analysis_paned)
+        analysis_bottom = ttk.Frame(analysis_paned)
+        analysis_paned.add(analysis_top, weight=3)
+        analysis_paned.add(analysis_bottom, weight=2)
+
+        ttk.Label(analysis_top, text="Respuesta (pegar aqui):").pack(anchor="w")
+        self.analysis_input = tk.Text(analysis_top, height=8, wrap="word")
+        self.analysis_input.pack(fill="both", expand=True, pady=(4, 6))
+        ttk.Button(
+            analysis_top, text="Procesar respuesta", command=self._process_analysis_response
+        ).pack(anchor="e")
+
+        ttk.Label(analysis_bottom, text="Resultado con enlaces:").pack(anchor="w")
+        self.analysis_output = tk.Text(analysis_bottom, state="disabled", wrap="word")
+        self.analysis_output.pack(fill="both", expand=True, pady=(4, 0))
 
     def _init_vlc(self) -> None:
         if not config.VLC_PATH:
@@ -867,6 +897,47 @@ class ConverterUI:
             current = self.search_index + 1 if total else 0
             self.search_count_label.config(text=f"{current}/{total}")
 
+    def _open_settings_window(self) -> None:
+        window = tk.Toplevel(self.root)
+        window.title("Configuracion")
+        width = 520
+        height = 220
+        window.geometry(f"{width}x{height}")
+        window.transient(self.root)
+        window.grab_set()
+        self.root.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - width) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - height) // 2
+        window.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+        frame = ttk.Frame(window, padding=12)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text="Ruta de VLC:").pack(anchor="w")
+        vlc_var = tk.StringVar(value=config.VLC_PATH)
+        entry = ttk.Entry(frame, textvariable=vlc_var)
+        entry.pack(fill="x", pady=(4, 8))
+
+        def browse_vlc() -> None:
+            path = filedialog.askopenfilename(
+                title="Seleccionar VLC",
+                filetypes=[("VLC", "vlc.exe"), ("Todos", "*.*")],
+            )
+            if path:
+                vlc_var.set(path)
+
+        def save_settings() -> None:
+            config.VLC_PATH = vlc_var.get().strip()
+            self._init_vlc()
+            self._threadsafe_log("Configuracion actualizada: VLC_PATH.")
+            window.destroy()
+
+        btns = ttk.Frame(frame)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Buscar...", command=browse_vlc).pack(side="left")
+        ttk.Button(btns, text="Guardar", command=save_settings).pack(side="right")
+        ttk.Button(btns, text="Cancelar", command=window.destroy).pack(side="right", padx=(0, 6))
+
     def _focus_search_hit(self) -> None:
         if not self.search_hits or self.search_index < 0:
             return
@@ -915,6 +986,191 @@ class ConverterUI:
             else:
                 cleaned_lines.append(line)
         return "\n".join(cleaned_lines)
+
+    def _generate_analysis_txt(self) -> None:
+        root_dir = Path(self.directory_var.get()).expanduser()
+        if not root_dir.exists():
+            self._threadsafe_log(f"Carpeta no encontrada: {root_dir}")
+            return
+        srt_paths = sorted(root_dir.glob(f"*{config.TRANSCRIPT_EXT}"))
+        if not srt_paths:
+            self._threadsafe_log("No se encontraron SRT para exportar.")
+            return
+        llm_dir = root_dir / config.LLM_DIRNAME
+        llm_dir.mkdir(parents=True, exist_ok=True)
+        output_path = llm_dir / "analysis_source.txt"
+        blocks: List[str] = []
+        for path in srt_paths:
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                self._threadsafe_log(f"No se pudo leer {path.name}: {exc}")
+                continue
+            blocks.append(f"ARCHIVO: {path.name}")
+            blocks.extend(self._clean_srt_lines(content))
+            notes = self._load_notes_for_transcript(path)
+            if notes:
+                blocks.append("NOTAS:")
+                for seconds, text in notes:
+                    time_label = self._format_seconds_hhmmss(seconds)
+                    blocks.append(f"NOTA {time_label} {text}")
+            blocks.append("")
+        output_path.write_text("\n".join(blocks).rstrip() + "\n", encoding="utf-8")
+        self._threadsafe_log(f"TXT generado: {output_path}")
+
+    def _clean_srt_lines(self, content: str) -> List[str]:
+        cleaned: List[str] = []
+        timestamp_re = re.compile(
+            r"^\d{2}:\d{2}:\d{2}[,\.]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[,\.]\d{3}$"
+        )
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.isdigit():
+                continue
+            if timestamp_re.match(line):
+                cleaned.append(line)
+            else:
+                cleaned.append(" ".join(line.split()))
+        return cleaned
+
+    def _load_notes_for_transcript(self, transcript_path: Path) -> List[Tuple[float, str]]:
+        notes_path = transcript_path.with_suffix(".notes.json")
+        if not notes_path.exists():
+            return []
+        try:
+            data = json.loads(notes_path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        if not isinstance(data, dict):
+            return []
+        notes: List[Tuple[float, str]] = []
+        for key, value in data.items():
+            if not isinstance(value, str):
+                continue
+            text = value.strip()
+            if not text:
+                continue
+            try:
+                seconds = float(key)
+            except (TypeError, ValueError):
+                continue
+            notes.append((seconds, text))
+        notes.sort(key=lambda item: item[0])
+        return notes
+
+    def _format_seconds_hhmmss(self, seconds: float) -> str:
+        total = max(0, int(seconds))
+        minutes, secs = divmod(total, 60)
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+    def _process_analysis_response(self) -> None:
+        if not self.analysis_input or not self.analysis_output:
+            return
+        raw = self.analysis_input.get("1.0", "end").strip()
+        if not raw:
+            return
+        self.analysis_links = {}
+        self.analysis_output.config(state="normal")
+        self.analysis_output.delete("1.0", "end")
+        pattern = re.compile(r"^(?P<file>.+?)\s*-\s*(?P<time>\d{2}:\d{2}:\d{2})\b")
+        for line in raw.splitlines():
+            match = pattern.match(line.strip())
+            if not match:
+                self.analysis_output.insert("end", f"{line}\n")
+                continue
+            file_name = match.group("file").strip()
+            time_str = match.group("time")
+            seconds = self._analysis_time_to_seconds(time_str)
+            transcript = self._analysis_find_transcript(file_name)
+            if transcript:
+                tag = f"analysis_{len(self.analysis_links)}"
+                self.analysis_links[tag] = (transcript, seconds)
+                self.analysis_output.insert("end", f"{line}\n", (tag,))
+                self.analysis_output.tag_config(tag, foreground="blue", underline=True)
+                self.analysis_output.tag_bind(
+                    tag, "<Button-1>", lambda _event, key=tag: self._on_analysis_link_click(key)
+                )
+            else:
+                self.analysis_output.insert("end", f"{line}\n")
+        self.analysis_output.see("end")
+        self.analysis_output.config(state="disabled")
+
+    def _show_analysis_prompt(self) -> None:
+        window = tk.Toplevel(self.root)
+        window.title("Prompt de Analisis")
+        width = 640
+        height = 420
+        window.geometry(f"{width}x{height}")
+        window.transient(self.root)
+        window.grab_set()
+        self.root.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - width) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - height) // 2
+        window.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+        ttk.Label(window, text="Prompt sugerido:").pack(anchor="w", padx=10, pady=(10, 4))
+        text = tk.Text(window, wrap="word")
+        text.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        text.insert("end", config.ANALYSIS_PROMPT)
+        text.config(state="disabled")
+
+        ttk.Button(window, text="Cerrar", command=window.destroy).pack(pady=(0, 10))
+
+    def _analysis_time_to_seconds(self, value: str) -> float:
+        parts = value.split(":")
+        if len(parts) != 3:
+            return 0.0
+        hours, minutes, seconds = parts
+        return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+    def _analysis_find_transcript(self, file_name: str) -> Optional[Path]:
+        root_dir = Path(self.directory_var.get()).expanduser()
+        candidate = root_dir / file_name
+        if candidate.exists():
+            if candidate.suffix.lower() == config.TRANSCRIPT_EXT:
+                return candidate
+            transcript = candidate.with_suffix(config.TRANSCRIPT_EXT)
+            if transcript.exists():
+                return transcript
+        stem = Path(file_name).stem
+        for path in root_dir.glob(f"*{config.TRANSCRIPT_EXT}"):
+            if path.stem == stem:
+                return path
+        return None
+
+    def _on_analysis_link_click(self, tag: str) -> None:
+        link = self.analysis_links.get(tag)
+        if not link:
+            return
+        transcript_path, seconds = link
+        self._open_transcript_at(transcript_path, seconds)
+
+    def _open_transcript_at(self, transcript_path: Path, seconds: float) -> None:
+        if not transcript_path.exists():
+            self._threadsafe_log(f"No se encontro la transcripcion: {transcript_path.name}")
+            return
+        try:
+            content = transcript_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            self._threadsafe_log(f"No se pudo leer {transcript_path.name}: {exc}")
+            return
+        self.current_transcript_path = transcript_path
+        self.current_transcript_content = content
+        self._load_annotations()
+        media_info = self._find_media_for_transcript(transcript_path)
+        if media_info:
+            media_path, is_video = media_info
+            if not is_video:
+                self._threadsafe_log(f"No se encontro video, reproduciendo audio: {media_path.name}")
+            self._load_media(media_path)
+        self._render_transcript(content)
+        if not self._ensure_player_window():
+            return
+        self.vlc_player.play()
+        self.root.after(200, lambda: self._seek_to(seconds))
 
     def _on_close(self) -> None:
         self.closing = True
