@@ -3,7 +3,7 @@ import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, simpledialog, ttk
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, List, Optional
 
 from app import config
 from app.converter import convert_with_progress, transcribe_with_timestamps
@@ -16,6 +16,7 @@ class ConverterUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Video a Audio")
+        self.root.state("zoomed")
 
         self.directory_var = tk.StringVar(value=str(Path.cwd()))
         self.status_var = tk.StringVar(value="Selecciona una carpeta para vigilar.")
@@ -32,15 +33,30 @@ class ConverterUI:
         self.stop_event = threading.Event()
         self.active_process: Optional[subprocess.Popen] = None
         self.closing = False
+
+        self.transcript_paths: List[Path] = []
+        self.filtered_transcripts: List[Path] = []
+        self.search_var = tk.StringVar()
+
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build_ui()
+        self._refresh_transcripts()
+        self.search_var.trace_add("write", self._on_search_change)
 
     def _build_ui(self) -> None:
-        top_frame = ttk.Frame(self.root, padding=10)
+        paned = ttk.PanedWindow(self.root, orient="horizontal")
+        paned.pack(fill="both", expand=True)
+
+        left_frame = ttk.Frame(paned)
+        right_frame = ttk.Frame(paned)
+        paned.add(left_frame, weight=3)
+        paned.add(right_frame, weight=2)
+
+        top_frame = ttk.Frame(left_frame, padding=10)
         top_frame.pack(fill="both", expand=True)
 
-        ttk.Label(top_frame, text="Carpeta Origen:").pack(anchor="w")
+        ttk.Label(top_frame, text="Carpeta a vigilar:").pack(anchor="w")
         dir_frame = ttk.Frame(top_frame)
         dir_frame.pack(fill="x", pady=(0, 8))
 
@@ -74,14 +90,30 @@ class ConverterUI:
 
         log_frame = ttk.LabelFrame(top_frame, text="Actividad")
         log_frame.pack(fill="both", expand=True)
-        self.log_text = tk.Text(log_frame, height=10, state="disabled")
+        self.log_text = tk.Text(log_frame, height=6, state="disabled")
         self.log_text.pack(fill="both", expand=True)
+
+        list_frame = ttk.LabelFrame(top_frame, text="Transcripciones")
+        list_frame.pack(fill="both", expand=False, pady=(8, 0))
+        search_frame = ttk.Frame(list_frame)
+        search_frame.pack(fill="x", padx=4, pady=(4, 0))
+        ttk.Label(search_frame, text="Buscar:").pack(side="left")
+        search_entry = ttk.Entry(search_frame, textvariable=self.search_var)
+        search_entry.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        self.transcript_list = tk.Listbox(list_frame, height=10)
+        self.transcript_list.pack(fill="both", expand=True)
+        self.transcript_list.bind("<<ListboxSelect>>", self._show_transcript)
+
+        ttk.Label(right_frame, text="Transcripcion").pack(anchor="w", padx=10, pady=(10, 0))
+        self.transcript_text = tk.Text(right_frame, state="disabled", wrap="word")
+        self.transcript_text.pack(fill="both", expand=True, padx=10, pady=10)
 
     def _choose_directory(self) -> None:
         selected = filedialog.askdirectory(initialdir=self.directory_var.get())
         if selected:
             self.directory_var.set(selected)
             self._log(f"Carpeta seleccionada: {selected}")
+            self._refresh_transcripts()
 
     def _toggle_watch(self) -> None:
         if not self.watching:
@@ -144,12 +176,12 @@ class ConverterUI:
         self.processing = True
         self.status_var.set(f"Archivo detectado: {next_file.name}")
         self._threadsafe_log("-" * 40)
-        self._threadsafe_log(f"🆕 Archivo detectado: {next_file.name}")
+        self._threadsafe_log(f"Archivo detectado: {next_file.name}")
 
         desired_name = self._ask_for_name(next_file)
         if desired_name is None:
             self.watcher.mark_processed(next_file)
-            self._threadsafe_log(f"⏭️ Archivo omitido: {next_file.name}")
+            self._threadsafe_log(f"Archivo omitido: {next_file.name}")
             self.processing = False
             return
 
@@ -157,7 +189,7 @@ class ConverterUI:
             renamed = self._rename_input_file(next_file, desired_name)
             if renamed is None:
                 self.watcher.mark_processed(next_file)
-                self._threadsafe_log(f"⚠️ No se pudo renombrar {next_file.name}.")
+                self._threadsafe_log(f"No se pudo renombrar {next_file.name}.")
                 self.processing = False
                 return
             if renamed != next_file:
@@ -168,13 +200,13 @@ class ConverterUI:
         transcript_path = audio_path.with_suffix(config.TRANSCRIPT_EXT)
         if audio_path.exists() and transcript_path.exists():
             self.watcher.mark_processed(next_file)
-            self._threadsafe_log(f"⏭️ Ya existe salida para {next_file.name}.")
+            self._threadsafe_log(f"Ya existe salida para {next_file.name}.")
             self.processing = False
             self.status_var.set("En espera de un nuevo archivo.")
             return
 
-        self._threadsafe_log(f"🎬 Archivo: {next_file.name}")
-        self._threadsafe_log("🔊 Iniciando conversion a audio...")
+        self._threadsafe_log(f"Archivo: {next_file.name}")
+        self._threadsafe_log("Iniciando conversion a audio...")
 
         def worker() -> None:
             if self.stop_event.is_set() or self.closing:
@@ -189,7 +221,7 @@ class ConverterUI:
                 )
                 if self.stop_event.is_set() or self.closing:
                     return
-                self._threadsafe_log("📝 Iniciando transcripcion...")
+                self._threadsafe_log("Iniciando transcripcion...")
                 transcribe_with_timestamps(
                     audio_path,
                     transcript_path,
@@ -200,12 +232,13 @@ class ConverterUI:
                 if self.stop_event.is_set() or self.closing:
                     return
                 self.watcher.mark_processed(next_file)
-                self._threadsafe_log(f"✅ Audio listo: {audio_path.name}")
-                self._threadsafe_log(f"✅ Transcripcion lista: {transcript_path.name}")
+                self._threadsafe_log(f"Audio listo: {audio_path.name}")
+                self._threadsafe_log(f"Transcripcion lista: {transcript_path.name}")
+                self._threadsafe_refresh_transcripts()
             except Exception as exc:
                 # Marcar como procesado para evitar reintentos infinitos; el usuario puede moverlo y reintentar.
                 self.watcher.mark_processed(next_file)
-                self._threadsafe_log(f"⚠️ Error procesando {next_file.name}: {exc}")
+                self._threadsafe_log(f"Error procesando {next_file.name}: {exc}")
             finally:
                 if not self.closing:
                     try:
@@ -247,15 +280,62 @@ class ConverterUI:
         if new_path == file_path:
             return file_path
         if new_path.exists():
-            self._threadsafe_log(f"⚠️ Ya existe un archivo llamado {new_path.name}.")
+            self._threadsafe_log(f"Ya existe un archivo llamado {new_path.name}.")
             return file_path
         try:
             file_path.rename(new_path)
-            self._threadsafe_log(f"✏️ Renombrado a: {new_path.name}")
+            self._threadsafe_log(f"Renombrado a: {new_path.name}")
             return new_path
         except OSError as exc:
-            self._threadsafe_log(f"⚠️ Error renombrando {file_path.name}: {exc}")
+            self._threadsafe_log(f"Error renombrando {file_path.name}: {exc}")
             return None
+
+    def _refresh_transcripts(self) -> None:
+        directory = Path(self.directory_var.get()).expanduser()
+        if not directory.exists():
+            return
+        self.transcript_paths = sorted(directory.glob(f"*{config.TRANSCRIPT_EXT}"))
+        self._apply_transcript_filter()
+
+    def _apply_transcript_filter(self) -> None:
+        query = self.search_var.get().strip().lower()
+        if query:
+            self.filtered_transcripts = [
+                path for path in self.transcript_paths if query in path.name.lower()
+            ]
+        else:
+            self.filtered_transcripts = list(self.transcript_paths)
+        self.transcript_list.delete(0, "end")
+        for path in self.filtered_transcripts:
+            self.transcript_list.insert("end", path.name)
+
+    def _threadsafe_refresh_transcripts(self) -> None:
+        if self.closing:
+            return
+        try:
+            self.root.after(0, self._refresh_transcripts)
+        except tk.TclError:
+            pass
+
+    def _show_transcript(self, _event: object) -> None:
+        selection = self.transcript_list.curselection()
+        if not selection:
+            return
+        index = selection[0]
+        if index >= len(self.filtered_transcripts):
+            return
+        path = self.filtered_transcripts[index]
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            content = f"No se pudo leer {path.name}: {exc}"
+        self.transcript_text.config(state="normal")
+        self.transcript_text.delete("1.0", "end")
+        self.transcript_text.insert("end", content)
+        self.transcript_text.config(state="disabled")
+
+    def _on_search_change(self, *_args: object) -> None:
+        self._apply_transcript_filter()
 
     def _on_close(self) -> None:
         self.closing = True
