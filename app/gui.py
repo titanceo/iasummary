@@ -127,9 +127,16 @@ class ConverterUI:
         self.transcript_list.pack(fill="both", expand=True)
         self.transcript_list.bind("<<ListboxSelect>>", self._show_transcript)
 
-        ttk.Label(right_frame, text="Transcripcion").pack(anchor="w", padx=10, pady=(10, 0))
-        transcript_controls = ttk.Frame(right_frame)
-        transcript_controls.pack(fill="x", padx=10, pady=(6, 0))
+        notebook = ttk.Notebook(right_frame)
+        notebook.pack(fill="both", expand=True, padx=10, pady=10)
+
+        transcript_tab = ttk.Frame(notebook)
+        chat_tab = ttk.Frame(notebook)
+        notebook.add(transcript_tab, text="Transcripcion")
+        notebook.add(chat_tab, text="Chat")
+
+        transcript_controls = ttk.Frame(transcript_tab)
+        transcript_controls.pack(fill="x", pady=(6, 0))
         ttk.Label(transcript_controls, text="Buscar en SRT:").pack(side="left")
         transcript_search = ttk.Entry(transcript_controls, textvariable=self.transcript_search_var)
         transcript_search.pack(side="left", fill="x", expand=True, padx=(6, 6))
@@ -140,9 +147,21 @@ class ConverterUI:
         ttk.Button(transcript_controls, text="Guardar SRT", command=self._save_transcript).pack(
             side="right"
         )
-        self.transcript_text = tk.Text(right_frame, state="normal", wrap="word")
-        self.transcript_text.pack(fill="both", expand=True, padx=10, pady=10)
+        self.transcript_text = tk.Text(transcript_tab, state="normal", wrap="word")
+        self.transcript_text.pack(fill="both", expand=True, pady=(6, 0))
         self.transcript_search_var.trace_add("write", self._on_transcript_search_change)
+
+        chat_paned = ttk.PanedWindow(chat_tab, orient="vertical")
+        chat_paned.pack(fill="both", expand=True)
+        chat_top = ttk.Frame(chat_paned)
+        chat_bottom = ttk.Frame(chat_paned)
+        chat_paned.add(chat_top, weight=4)
+        chat_paned.add(chat_bottom, weight=1)
+
+        self.chat_text = tk.Text(chat_top, state="disabled", wrap="word")
+        self.chat_text.pack(fill="both", expand=True)
+        self.chat_input = tk.Text(chat_bottom, height=4, wrap="word")
+        self.chat_input.pack(fill="both", expand=True)
 
     def _init_vlc(self) -> None:
         if not config.VLC_PATH:
