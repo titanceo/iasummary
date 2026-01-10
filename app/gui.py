@@ -1,4 +1,5 @@
-﻿import os
+import json
+import os
 import re
 import subprocess
 import threading
@@ -42,6 +43,8 @@ class ConverterUI:
         self.search_var = tk.StringVar()
         self.transcript_search_var = tk.StringVar()
         self.timestamp_tags: Dict[str, float] = {}
+        self.note_tags: Dict[str, str] = {}
+        self.annotations: Dict[str, str] = {}
         self.search_hits: List[str] = []
         self.search_index = -1
         self.search_count_label: Optional[ttk.Label] = None
@@ -60,6 +63,7 @@ class ConverterUI:
         self.time_label: Optional[ttk.Label] = None
         self.current_audio_path: Optional[Path] = None
         self.current_transcript_path: Optional[Path] = None
+        self.current_transcript_content: str = ""
         self.list_frame: Optional[ttk.LabelFrame] = None
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -68,6 +72,7 @@ class ConverterUI:
         self._init_vlc()
         self._refresh_transcripts()
         self.search_var.trace_add("write", self._on_search_change)
+        self.transcript_search_var.trace_add("write", self._on_transcript_search_change)
 
     def _build_ui(self) -> None:
         paned = ttk.PanedWindow(self.root, orient="horizontal")
@@ -620,6 +625,8 @@ class ConverterUI:
             content = f"No se pudo leer {path.name}: {exc}"
 
         self.current_transcript_path = path
+        self.current_transcript_content = content
+        self._load_annotations()
         media_info = self._find_media_for_transcript(path)
         if media_info:
             media_path, is_video = media_info
@@ -632,6 +639,7 @@ class ConverterUI:
         self.transcript_text.config(state="normal")
         self.transcript_text.delete("1.0", "end")
         self.timestamp_tags.clear()
+        self.note_tags.clear()
 
         timestamp_re = re.compile(
             r"^(\d{2}:\d{2}:\d{2}[,\.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,\.]\d{3})"
@@ -644,12 +652,25 @@ class ConverterUI:
                 end = match.group(2)
                 seconds = self._srt_time_to_seconds(start)
                 tag = f"time_{len(self.timestamp_tags)}"
+                note_tag = f"note_{len(self.note_tags)}"
+                note_key = self._timestamp_key(seconds)
                 self.timestamp_tags[tag] = seconds
+                self.note_tags[note_tag] = note_key
                 self.transcript_text.insert("end", start, (tag,))
-                self.transcript_text.insert("end", f" --> {end}\n")
+                self.transcript_text.insert("end", f" --> {end}")
+                self.transcript_text.insert("end", " ")
+                self.transcript_text.insert("end", "●", (note_tag,))
+                self.transcript_text.insert("end", "\n")
                 self.transcript_text.tag_config(tag, foreground="blue", underline=True)
                 self.transcript_text.tag_bind(
                     tag, "<Button-1>", lambda _event, key=tag: self._on_timestamp_click(key)
+                )
+                color = "#d32f2f" if note_key in self.annotations else "#9e9e9e"
+                self.transcript_text.tag_config(
+                    note_tag, foreground=color, underline=True, font="TkDefaultFont 14 bold"
+                )
+                self.transcript_text.tag_bind(
+                    note_tag, "<Button-1>", lambda _event, key=note_key: self._open_annotation_editor(key)
                 )
             else:
                 self.transcript_text.insert("end", f"{line}\n")
@@ -662,6 +683,86 @@ class ConverterUI:
             return 0.0
         hours, minutes, seconds = parts
         return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+    def _timestamp_key(self, seconds: float) -> str:
+        return f"{seconds:.3f}"
+
+    def _annotations_path(self) -> Optional[Path]:
+        if not self.current_transcript_path:
+            return None
+        return self.current_transcript_path.with_suffix(".notes.json")
+
+    def _load_annotations(self) -> None:
+        self.annotations = {}
+        path = self._annotations_path()
+        if not path or not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                self.annotations = {str(k): str(v) for k, v in data.items()}
+        except Exception:
+            self.annotations = {}
+
+    def _save_annotations(self) -> None:
+        path = self._annotations_path()
+        if not path:
+            return
+        try:
+            path.write_text(json.dumps(self.annotations, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            self._threadsafe_log(f"Error guardando anotaciones: {exc}")
+
+    def _open_annotation_editor(self, note_key: str) -> None:
+        if not self.current_transcript_path:
+            return
+        window = tk.Toplevel(self.root)
+        window.title("Anotacion")
+        width = 420
+        height = 260
+        window.geometry(f"{width}x{height}")
+        window.transient(self.root)
+        self.root.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - width) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - height) // 2
+        window.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+        ttk.Label(window, text=f"Tiempo: {note_key}s").pack(anchor="w", padx=10, pady=(10, 4))
+        text = tk.Text(window, wrap="word", height=6)
+        text.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        existing = self.annotations.get(note_key, "")
+        if existing:
+            text.insert("end", existing)
+
+        btns = ttk.Frame(window)
+        btns.pack(fill="x", padx=10, pady=(0, 10))
+
+        def save_note() -> None:
+            value = text.get("1.0", "end").strip()
+            if value:
+                self.annotations[note_key] = value
+            else:
+                self.annotations.pop(note_key, None)
+            self._save_annotations()
+            self._update_note_tag_color(note_key)
+            window.destroy()
+
+        def delete_note() -> None:
+            self.annotations.pop(note_key, None)
+            self._save_annotations()
+            self._update_note_tag_color(note_key)
+            window.destroy()
+
+        ttk.Button(btns, text="Guardar", command=save_note).pack(side="left")
+        ttk.Button(btns, text="Eliminar", command=delete_note).pack(side="left", padx=(6, 0))
+        ttk.Button(btns, text="Cerrar", command=window.destroy).pack(side="right")
+
+    def _update_note_tag_color(self, note_key: str) -> None:
+        for tag, key in self.note_tags.items():
+            if key == note_key:
+                color = "#2e7d32" if note_key in self.annotations else "#9e9e9e"
+                self.transcript_text.tag_config(tag, foreground=color)
+                break
 
     def _find_media_for_transcript(self, transcript_path: Path) -> Optional[Tuple[Path, bool]]:
         directory = transcript_path.parent
@@ -796,11 +897,24 @@ class ConverterUI:
             self._threadsafe_log("No hay transcripcion seleccionada para guardar.")
             return
         try:
-            content = self.transcript_text.get("1.0", "end").rstrip() + "\n"
+            raw = self.transcript_text.get("1.0", "end")
+            content = self._strip_note_icons(raw).rstrip() + "\n"
             self.current_transcript_path.write_text(content, encoding="utf-8")
+            self.current_transcript_content = content
             self._threadsafe_log(f"SRT guardado: {self.current_transcript_path.name}")
         except OSError as exc:
             self._threadsafe_log(f"Error guardando SRT: {exc}")
+
+    def _strip_note_icons(self, text: str) -> str:
+        cleaned_lines: List[str] = []
+        for line in text.splitlines():
+            if line.endswith(" ●"):
+                cleaned_lines.append(line[:-2])
+            elif line.endswith("●"):
+                cleaned_lines.append(line[:-1])
+            else:
+                cleaned_lines.append(line)
+        return "\n".join(cleaned_lines)
 
     def _on_close(self) -> None:
         self.closing = True
