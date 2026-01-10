@@ -996,6 +996,61 @@ class ConverterUI:
         if not srt_paths:
             self._threadsafe_log("No se encontraron SRT para exportar.")
             return
+        self._open_srt_selection_window(srt_paths)
+
+    def _open_srt_selection_window(self, srt_paths: List[Path]) -> None:
+        window = tk.Toplevel(self.root)
+        window.title("Seleccionar archivos")
+        width = 520
+        height = 420
+        window.geometry(f"{width}x{height}")
+        window.transient(self.root)
+        window.grab_set()
+        self.root.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - width) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - height) // 2
+        window.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+        frame = ttk.Frame(window, padding=10)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Selecciona los SRT a incluir:").pack(anchor="w")
+
+        list_frame = ttk.Frame(frame)
+        list_frame.pack(fill="both", expand=True, pady=(6, 6))
+        listbox = tk.Listbox(list_frame, selectmode="extended")
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
+        listbox.config(yscrollcommand=scrollbar.set)
+        listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        for path in srt_paths:
+            listbox.insert("end", path.name)
+        listbox.select_set(0, "end")
+
+        def select_all() -> None:
+            listbox.select_set(0, "end")
+
+        def select_none() -> None:
+            listbox.selection_clear(0, "end")
+
+        def confirm() -> None:
+            selection = listbox.curselection()
+            if not selection:
+                self._threadsafe_log("No se seleccionaron archivos.")
+                return
+            chosen = [srt_paths[idx] for idx in selection]
+            window.destroy()
+            self._generate_analysis_txt_for_paths(chosen)
+
+        btns = ttk.Frame(frame)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Seleccionar todo", command=select_all).pack(side="left")
+        ttk.Button(btns, text="Limpiar", command=select_none).pack(side="left", padx=(6, 0))
+        ttk.Button(btns, text="Cancelar", command=window.destroy).pack(side="right")
+        ttk.Button(btns, text="Generar", command=confirm).pack(side="right", padx=(0, 6))
+
+    def _generate_analysis_txt_for_paths(self, srt_paths: List[Path]) -> None:
+        root_dir = Path(self.directory_var.get()).expanduser()
         llm_dir = root_dir / config.LLM_DIRNAME
         llm_dir.mkdir(parents=True, exist_ok=True)
         output_path = llm_dir / "analysis_source.txt"
