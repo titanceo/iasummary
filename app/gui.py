@@ -1,13 +1,18 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import threading
 import tkinter as tk
+import wave
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, simpledialog, ttk
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+import sounddevice as sd
 
 from app import config
 from app.converter import convert_with_progress, transcribe_with_timestamps
@@ -68,6 +73,10 @@ class ConverterUI:
         self.analysis_links: Dict[str, Tuple[Path, float]] = {}
         self.analysis_input: Optional[tk.Text] = None
         self.analysis_output: Optional[tk.Text] = None
+        self.recording_note = False
+        self.recording_stream: Optional[sd.InputStream] = None
+        self.recording_frames: List[np.ndarray] = []
+        self.recording_timestamp: Optional[float] = None
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -758,6 +767,8 @@ class ConverterUI:
         window.geometry(f"+{max(0, x)}+{max(0, y)}")
 
         ttk.Label(window, text=f"Tiempo: {note_key}s").pack(anchor="w", padx=10, pady=(10, 4))
+        status_label = ttk.Label(window, text="Estado: listo")
+        status_label.pack(anchor="w", padx=10, pady=(0, 4))
         text = tk.Text(window, wrap="word", height=6)
         text.pack(fill="both", expand=True, padx=10, pady=(0, 8))
         existing = self.annotations.get(note_key, "")
@@ -784,8 +795,189 @@ class ConverterUI:
             window.destroy()
 
         ttk.Button(btns, text="Guardar", command=save_note).pack(side="left")
+        record_btn = ttk.Button(btns, text="Grabar nota")
+        record_btn.pack(side="left", padx=(6, 0))
+        record_btn.config(
+            command=lambda key=note_key, btn=record_btn, lbl=status_label, txt=text: (
+                self._toggle_record_note(key, btn, lbl, txt)
+            )
+        )
         ttk.Button(btns, text="Eliminar", command=delete_note).pack(side="left", padx=(6, 0))
         ttk.Button(btns, text="Cerrar", command=window.destroy).pack(side="right")
+
+    def _toggle_record_note(
+        self,
+        timestamp_key: Optional[str] = None,
+        button: Optional[ttk.Button] = None,
+        status_label: Optional[ttk.Label] = None,
+        text_widget: Optional[tk.Text] = None,
+    ) -> None:
+        if self.recording_note:
+            self._stop_record_note(button, status_label, text_widget)
+        else:
+            self._start_record_note(timestamp_key, button, status_label, text_widget)
+
+    def _start_record_note(
+        self,
+        timestamp_key: Optional[str] = None,
+        button: Optional[ttk.Button] = None,
+        status_label: Optional[ttk.Label] = None,
+        text_widget: Optional[tk.Text] = None,
+    ) -> None:
+        if not self.current_transcript_path:
+            self._threadsafe_log("Selecciona una transcripcion antes de grabar notas.")
+            return
+        if timestamp_key is not None:
+            try:
+                self.recording_timestamp = float(timestamp_key)
+            except ValueError:
+                self._threadsafe_log("Timestamp invalido para la nota.")
+                return
+        else:
+            if not self.vlc_player:
+                self._threadsafe_log("Reproductor no disponible para asignar tiempo.")
+                return
+            current_ms = self.vlc_player.get_time()
+            if current_ms is None or current_ms < 0:
+                self._threadsafe_log("No se pudo obtener el tiempo actual del reproductor.")
+                return
+            self.recording_timestamp = current_ms / 1000.0
+        self.recording_frames = []
+        try:
+            self.recording_stream = sd.InputStream(
+                samplerate=config.NOTE_SAMPLE_RATE,
+                channels=1,
+                dtype="int16",
+                callback=self._on_record_audio,
+            )
+            self.recording_stream.start()
+        except Exception as exc:
+            self.recording_stream = None
+            self._threadsafe_log(f"No se pudo iniciar grabacion: {exc}")
+            return
+        self.recording_note = True
+        if button:
+            button.config(text="Detener grabacion")
+        if status_label:
+            status_label.config(text="Estado: grabando...")
+        self._threadsafe_log("Grabando nota... vuelve a pulsar para detener.")
+
+    def _on_record_audio(self, indata: np.ndarray, _frames: int, _time: Any, _status: Any) -> None:
+        self.recording_frames.append(indata.copy())
+
+    def _stop_record_note(
+        self,
+        button: Optional[ttk.Button] = None,
+        status_label: Optional[ttk.Label] = None,
+        text_widget: Optional[tk.Text] = None,
+    ) -> None:
+        if not self.recording_note:
+            return
+        stream = self.recording_stream
+        self.recording_stream = None
+        if stream:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
+        self.recording_note = False
+        if button:
+            button.config(text="Grabar nota")
+        if status_label:
+            status_label.config(text="Estado: transcribiendo...")
+        if not self.recording_frames or self.recording_timestamp is None:
+            self._threadsafe_log("Grabacion vacia.")
+            if status_label:
+                status_label.config(text="Estado: sin audio")
+            return
+        audio = np.concatenate(self.recording_frames, axis=0)
+        threading.Thread(
+            target=self._transcribe_recorded_note,
+            args=(audio, self.recording_timestamp, status_label, text_widget),
+            daemon=True,
+        ).start()
+        self.recording_frames = []
+
+    def _transcribe_recorded_note(
+        self,
+        audio: np.ndarray,
+        timestamp: float,
+        status_label: Optional[ttk.Label],
+        text_widget: Optional[tk.Text],
+    ) -> None:
+        if not self.current_transcript_path:
+            return
+        root_dir = self.current_transcript_path.parent
+        llm_dir = root_dir / config.LLM_DIRNAME
+        llm_dir.mkdir(parents=True, exist_ok=True)
+        stem = self.current_transcript_path.stem
+        safe_ts = int(timestamp * 1000)
+        audio_path = llm_dir / f"note_{stem}_{safe_ts}.wav"
+        text_path = audio_path.with_suffix(".txt")
+        try:
+            self._write_wav(audio_path, audio, config.NOTE_SAMPLE_RATE)
+        except Exception as exc:
+            self._threadsafe_log(f"No se pudo guardar audio: {exc}")
+            if status_label:
+                self.root.after(0, status_label.config, {"text": "Estado: error al guardar"})
+            return
+        try:
+            self._run_whisper_note(audio_path, llm_dir)
+            if not text_path.exists():
+                self._threadsafe_log("No se encontro texto transcrito.")
+                if status_label:
+                    self.root.after(0, status_label.config, {"text": "Estado: sin transcripcion"})
+                return
+            text = text_path.read_text(encoding="utf-8", errors="replace").strip()
+        except Exception as exc:
+            self._threadsafe_log(f"Error transcribiendo nota: {exc}")
+            if status_label:
+                self.root.after(0, status_label.config, {"text": "Estado: error al transcribir"})
+            return
+        if not text:
+            self._threadsafe_log("Transcripcion vacia.")
+            if status_label:
+                self.root.after(0, status_label.config, {"text": "Estado: transcripcion vacia"})
+            return
+        note_key = self._timestamp_key(timestamp)
+        self.annotations[note_key] = text
+        self._save_annotations()
+        self._update_note_tag_color(note_key)
+        self._threadsafe_log("Nota de voz guardada.")
+        if status_label:
+            self.root.after(0, status_label.config, {"text": "Estado: nota guardada"})
+        if text_widget:
+            def fill_text() -> None:
+                text_widget.delete("1.0", "end")
+                text_widget.insert("end", text)
+            self.root.after(0, fill_text)
+
+    def _write_wav(self, path: Path, audio: np.ndarray, sample_rate: int) -> None:
+        with wave.open(str(path), "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(audio.tobytes())
+
+    def _run_whisper_note(self, audio_path: Path, output_dir: Path) -> None:
+        if shutil.which("whisper") is None:
+            raise RuntimeError("whisper no esta instalado o no se encuentra en PATH.")
+        cmd: List[str] = [
+            "whisper",
+            str(audio_path),
+            "--model",
+            config.WHISPER_MODEL,
+            "--output_format",
+            "txt",
+            "--output_dir",
+            str(output_dir),
+            "--verbose",
+            "False",
+        ]
+        if config.WHISPER_LANGUAGE:
+            cmd += ["--language", config.WHISPER_LANGUAGE]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def _update_note_tag_color(self, note_key: str) -> None:
         for tag, key in self.note_tags.items():

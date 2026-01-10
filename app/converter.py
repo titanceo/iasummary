@@ -165,6 +165,8 @@ def transcribe_with_timestamps(
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,

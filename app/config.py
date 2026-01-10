@@ -13,6 +13,7 @@ LLM_DIRNAME = "LLM"
 LLM_TOP_K = 6
 LLM_MAX_CHUNK_SECONDS = 20
 LLM_MAX_CHUNK_CHARS = 600
+NOTE_SAMPLE_RATE = 16000
 ANALYSIS_PROMPT = (
     "Responde SOLO usando la evidencia del TXT adjunto.\n"
     "Para cada punto, incluye el nombre del archivo y el tiempo exacto.\n\n"
