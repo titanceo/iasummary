@@ -8,14 +8,19 @@ import tkinter as tk
 import wave
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, simpledialog, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import sounddevice as sd
 
 from app import config
-from app.converter import convert_with_progress, transcribe_with_timestamps
+from app.converter import (
+    convert_with_progress,
+    get_duration_seconds,
+    transcribe_with_timestamps,
+)
+from app.rag import parse_srt_segments
 from app.watcher import DirectoryWatcher
 
 
@@ -48,6 +53,7 @@ class ConverterUI:
         self.search_var = tk.StringVar()
         self.transcript_search_var = tk.StringVar()
         self.timestamp_tags: Dict[str, float] = {}
+        self.timestamp_ranges: Dict[str, Tuple[float, float]] = {}
         self.note_tags: Dict[str, str] = {}
         self.annotations: Dict[str, str] = {}
         self.search_hits: List[str] = []
@@ -678,6 +684,7 @@ class ConverterUI:
         self.transcript_text.config(state="normal")
         self.transcript_text.delete("1.0", "end")
         self.timestamp_tags.clear()
+        self.timestamp_ranges.clear()
         self.note_tags.clear()
 
         timestamp_re = re.compile(
@@ -690,10 +697,12 @@ class ConverterUI:
                 start = match.group(1)
                 end = match.group(2)
                 seconds = self._srt_time_to_seconds(start)
+                end_seconds = self._srt_time_to_seconds(end)
                 tag = f"time_{len(self.timestamp_tags)}"
                 note_tag = f"note_{len(self.note_tags)}"
                 note_key = self._timestamp_key(seconds)
                 self.timestamp_tags[tag] = seconds
+                self.timestamp_ranges[tag] = (seconds, end_seconds)
                 self.note_tags[note_tag] = note_key
                 self.transcript_text.insert("end", start, (tag,))
                 self.transcript_text.insert("end", f" --> {end}")
@@ -703,6 +712,9 @@ class ConverterUI:
                 self.transcript_text.tag_config(tag, foreground="blue", underline=True)
                 self.transcript_text.tag_bind(
                     tag, "<Button-1>", lambda _event, key=tag: self._on_timestamp_click(key)
+                )
+                self.transcript_text.tag_bind(
+                    tag, "<Button-3>", lambda event, key=tag: self._on_timestamp_context(event, key)
                 )
                 color = "#d32f2f" if note_key in self.annotations else "#9e9e9e"
                 self.transcript_text.tag_config(
@@ -1048,6 +1060,332 @@ class ConverterUI:
             return
         self.vlc_player.play()
         self.root.after(200, lambda: self._seek_to(seconds))
+
+    def _on_timestamp_context(self, event: tk.Event, tag: str) -> None:
+        if self.closing:
+            return
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="Ir a este tiempo", command=lambda: self._on_timestamp_click(tag))
+        menu.add_command(label="Eliminar esta seccion", command=lambda: self._confirm_cut_segment(tag))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _confirm_cut_segment(self, tag: str) -> None:
+        if not self.current_transcript_path:
+            self._threadsafe_log("Selecciona un SRT para recortar.")
+            return
+        if tag not in self.timestamp_ranges:
+            self._threadsafe_log("No se pudo obtener el rango del SRT.")
+            return
+        start, end = self.timestamp_ranges[tag]
+        if end <= start:
+            self._threadsafe_log("Rango de recorte invalido.")
+            return
+        start_label = self._format_seconds_hhmmss(start)
+        end_label = self._format_seconds_hhmmss(end)
+        prompt = (
+            f"Se cortara la seccion del {start_label} al {end_label}.\n\n"
+            "Se actualizaran el video/audio asociados y el SRT. "
+            "Se guardara un .bak de cada archivo antes del cambio.\n\n"
+            "¿Continuar?"
+        )
+        if not messagebox.askyesno("Confirmar recorte", prompt):
+            return
+        threading.Thread(target=self._cut_segment_worker, args=(start, end), daemon=True).start()
+
+    def _cut_segment_worker(self, start: float, end: float) -> None:
+        if self.closing or not self.current_transcript_path:
+            return
+        transcript_path = self.current_transcript_path
+        delta = end - start
+        if delta <= 0:
+            self._threadsafe_log("Rango de recorte invalido.")
+            return
+        self._threadsafe_log(
+            f"Cortando segmento {self._format_seconds_hhmmss(start)} -> {self._format_seconds_hhmmss(end)}..."
+        )
+        try:
+            self.root.after(0, self._stop_playback)
+        except Exception:
+            pass
+
+        media_info = self._find_media_for_transcript(transcript_path)
+        audio_path = transcript_path.with_suffix(config.AUDIO_EXT)
+        targets: List[Tuple[Path, bool]] = []
+        if media_info:
+            targets.append(media_info)
+        if audio_path.exists() and (not media_info or audio_path != media_info[0]):
+            targets.append((audio_path, False))
+        if not targets:
+            self._threadsafe_log("No se encontro video ni audio para recortar.")
+            return
+
+        errors: List[str] = []
+        for path, is_video in targets:
+            try:
+                self._cut_media_segment(path, is_video, start, end)
+                self._threadsafe_log(f"Recorte aplicado: {path.name}")
+            except Exception as exc:
+                errors.append(f"{path.name}: {exc}")
+
+        try:
+            self._cut_srt_file(transcript_path, start, end)
+            self._threadsafe_log(f"SRT actualizado: {transcript_path.name}")
+        except Exception as exc:
+            errors.append(f"SRT: {exc}")
+
+        try:
+            self._shift_notes_after_cut(start, end)
+        except Exception as exc:
+            self._threadsafe_log(f"No se pudieron ajustar notas: {exc}")
+
+        if errors:
+            for msg in errors:
+                self._threadsafe_log(f"Error recortando: {msg}")
+        else:
+            self._threadsafe_log("Recorte finalizado.")
+
+        self._threadsafe_refresh_transcripts()
+        try:
+            self.root.after(0, self._reload_after_cut)
+        except Exception:
+            pass
+
+    def _cut_media_segment(self, path: Path, is_video: bool, start: float, end: float) -> None:
+        if shutil.which("ffmpeg") is None:
+            raise RuntimeError("ffmpeg no esta instalado o no se encuentra en PATH.")
+
+        duration = get_duration_seconds(path)
+        safe_start = max(0.0, start)
+        safe_end = max(safe_start, end)
+        if duration:
+            safe_start = min(safe_start, duration)
+            safe_end = min(safe_end, duration)
+            if safe_start >= safe_end:
+                raise RuntimeError("Rango de recorte fuera de los limites del archivo.")
+            if safe_end - safe_start >= duration - 0.05:
+                raise RuntimeError("El rango eliminaria todo el archivo.")
+
+        temp_path = path.with_name(f"{path.stem}.tmp{path.suffix}")
+        backup_path = path.with_suffix(path.suffix + ".bak")
+        if temp_path.exists():
+            temp_path.unlink()
+
+        has_video = self._probe_has_stream(path, "v", default=is_video)
+        has_audio = self._probe_has_stream(path, "a", default=not is_video or True)
+
+        if not has_video and not has_audio:
+            raise RuntimeError("No se encontraron streams en el archivo.")
+
+        cut_front = safe_start <= 0.05
+        cut_tail = duration is not None and (duration - safe_end) <= 0.05
+        filter_parts: List[str] = []
+        map_parts: List[str] = []
+        audio_codec = self._audio_codec_for_ext(path)
+
+        if cut_front:
+            if has_video:
+                filter_parts.append(f"[0:v]trim={safe_end},setpts=PTS-STARTPTS[v_keep]")
+                map_parts.extend(["-map", "[v_keep]"])
+            if has_audio:
+                filter_parts.append(f"[0:a]atrim={safe_end},asetpts=PTS-STARTPTS[a_keep]")
+                map_parts.extend(["-map", "[a_keep]"])
+        elif cut_tail:
+            if has_video:
+                filter_parts.append(f"[0:v]trim=0:{safe_start},setpts=PTS-STARTPTS[v_keep]")
+                map_parts.extend(["-map", "[v_keep]"])
+            if has_audio:
+                filter_parts.append(f"[0:a]atrim=0:{safe_start},asetpts=PTS-STARTPTS[a_keep]")
+                map_parts.extend(["-map", "[a_keep]"])
+        else:
+            if has_video:
+                filter_parts.append(f"[0:v]trim=0:{safe_start},setpts=PTS-STARTPTS[v0]")
+                filter_parts.append(f"[0:v]trim={safe_end},setpts=PTS-STARTPTS[v1]")
+            if has_audio:
+                filter_parts.append(f"[0:a]atrim=0:{safe_start},asetpts=PTS-STARTPTS[a0]")
+                filter_parts.append(f"[0:a]atrim={safe_end},asetpts=PTS-STARTPTS[a1]")
+
+            if has_video and has_audio:
+                filter_parts.append("[v0][a0][v1][a1]concat=n=2:v=1:a=1[outv][outa]")
+                map_parts.extend(["-map", "[outv]", "-map", "[outa]"])
+            elif has_video:
+                filter_parts.append("[v0][v1]concat=n=2:v=1[outv]")
+                map_parts.extend(["-map", "[outv]"])
+            else:
+                filter_parts.append("[a0][a1]concat=n=2:v=0:a=1[outa]")
+                map_parts.extend(["-map", "[outa]"])
+
+        cmd: List[str] = ["ffmpeg", "-y", "-i", str(path)]
+        if filter_parts:
+            cmd.extend(["-filter_complex", ";".join(filter_parts)])
+        if has_video:
+            cmd.extend(["-c:v", "libx264", "-preset", "veryfast"])
+        if has_audio:
+            cmd.extend(["-c:a", audio_codec])
+        if not map_parts:
+            raise RuntimeError("No se generaron streams de salida para recortar.")
+        cmd.extend(map_parts)
+        out_format = self._ffmpeg_format_for_ext(path)
+        if out_format:
+            cmd.extend(["-f", out_format])
+        cmd.append(str(temp_path))
+
+        try:
+            result = subprocess.run(
+                cmd,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if result.returncode != 0:
+                tail = "\n".join(result.stderr.splitlines()[-10:])
+                temp_path.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"ffmpeg fallo (code {result.returncode}). Ultimas lineas:\n{tail}"
+                )
+        except subprocess.CalledProcessError as exc:
+            temp_path.unlink(missing_ok=True)
+            raise RuntimeError(f"ffmpeg fallo: {exc}") from exc
+
+        try:
+            path.replace(backup_path)
+            temp_path.replace(path)
+        except Exception as exc:
+            temp_path.unlink(missing_ok=True)
+            raise
+
+    def _probe_has_stream(self, path: Path, selector: str, default: bool = True) -> bool:
+        if shutil.which("ffprobe") is None:
+            return default
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            selector,
+            "-show_entries",
+            "stream=index",
+            "-of",
+            "csv=p=0",
+            str(path),
+        ]
+        try:
+            output = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True).strip()
+            return bool(output)
+        except Exception:
+            return default
+
+    def _audio_codec_for_ext(self, path: Path) -> str:
+        ext = path.suffix.lower()
+        if ext == ".mp3":
+            return "libmp3lame"
+        if ext in {".wav", ".wave"}:
+            return "pcm_s16le"
+        if ext in {".aac", ".m4a"}:
+            return "aac"
+        return "aac"
+
+    def _ffmpeg_format_for_ext(self, path: Path) -> Optional[str]:
+        ext = path.suffix.lower()
+        if ext in {".mp4", ".m4v"}:
+            return "mp4"
+        if ext == ".mkv":
+            return "matroska"
+        if ext == ".webm":
+            return "webm"
+        if ext == ".mov":
+            return "mov"
+        if ext == ".avi":
+            return "avi"
+        if ext == ".mp3":
+            return "mp3"
+        if ext in {".wav", ".wave"}:
+            return "wav"
+        if ext == ".aac":
+            return "adts"
+        return None
+
+    def _cut_srt_file(self, path: Path, start: float, end: float) -> None:
+        segments = parse_srt_segments(path)
+        if not segments:
+            raise RuntimeError("SRT vacio.")
+        delta = end - start
+        eps = 0.001
+        new_segments: List[Tuple[float, float, List[str]]] = []
+        for segment in segments:
+            seg_start = segment["start"]
+            seg_end = segment["end"]
+            if seg_end <= start + eps:
+                new_segments.append((seg_start, seg_end, segment["text"]))
+            elif seg_start >= end - eps:
+                new_segments.append((seg_start - delta, seg_end - delta, segment["text"]))
+            else:
+                continue
+
+        if not new_segments:
+            raise RuntimeError("El recorte eliminaria todo el SRT.")
+
+        lines: List[str] = []
+        for idx, (seg_start, seg_end, texts) in enumerate(new_segments, start=1):
+            lines.append(str(idx))
+            lines.append(f"{self._format_srt_time(seg_start)} --> {self._format_srt_time(seg_end)}")
+            lines.extend(texts)
+            lines.append("")
+
+        temp_path = path.with_suffix(path.suffix + ".tmp")
+        backup_path = path.with_suffix(path.suffix + ".bak")
+        temp_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        path.replace(backup_path)
+        temp_path.replace(path)
+
+    def _format_srt_time(self, value: float) -> str:
+        if value < 0:
+            value = 0.0
+        hours = int(value // 3600)
+        minutes = int((value % 3600) // 60)
+        seconds = int(value % 60)
+        millis = int(round((value - int(value)) * 1000))
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+
+    def _shift_notes_after_cut(self, start: float, end: float) -> None:
+        delta = end - start
+        if delta <= 0:
+            return
+        self._load_annotations()
+        if not self.annotations:
+            return
+        updated: Dict[str, str] = {}
+        eps = 0.001
+        for key, text in self.annotations.items():
+            try:
+                ts = float(key)
+            except (TypeError, ValueError):
+                continue
+            if start - eps <= ts <= end + eps:
+                continue
+            if ts > end:
+                ts -= delta
+            updated[self._timestamp_key(ts)] = text
+        self.annotations = updated
+        self._save_annotations()
+
+    def _reload_after_cut(self) -> None:
+        if not self.current_transcript_path or self.closing:
+            return
+        try:
+            content = self.current_transcript_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            self._threadsafe_log(f"No se pudo recargar {self.current_transcript_path.name}: {exc}")
+            return
+        self.current_transcript_content = content
+        self._load_annotations()
+        media_info = self._find_media_for_transcript(self.current_transcript_path)
+        if media_info:
+            self._load_media(media_info[0])
+        self._render_transcript(content)
 
     def _seek_to(self, seconds: float) -> None:
         if not self.vlc_player:
