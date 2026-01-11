@@ -19,6 +19,8 @@ class DirectoryWatcher:
             if (
                 file.is_file()
                 and file.suffix.lower() in allowed_exts
+                and ".tmp." not in file.name
+                and not file.name.endswith(".bak")
                 and file not in self.processed
                 and file not in self.enqueued
                 and file not in self.in_progress

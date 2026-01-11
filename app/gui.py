@@ -54,6 +54,7 @@ class ConverterUI:
         self.transcript_search_var = tk.StringVar()
         self.timestamp_tags: Dict[str, float] = {}
         self.timestamp_ranges: Dict[str, Tuple[float, float]] = {}
+        self.rendered_segments: List[Tuple[str, float, float]] = []
         self.note_tags: Dict[str, str] = {}
         self.annotations: Dict[str, str] = {}
         self.search_hits: List[str] = []
@@ -83,6 +84,7 @@ class ConverterUI:
         self.recording_stream: Optional[sd.InputStream] = None
         self.recording_frames: List[np.ndarray] = []
         self.recording_timestamp: Optional[float] = None
+        self.cutting = False
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -579,15 +581,18 @@ class ConverterUI:
 
     def _ask_for_name(self, file_path: Path) -> Optional[str]:
         prompt = "Nombre para salida (sin extension). Deja igual o cambia:"
+        base_name = file_path.stem
+        if re.match(r"^\d{4}-\d{2}-\d{2}_\d{6}", base_name):
+            return base_name
         name = simpledialog.askstring(
             "Nombre del archivo",
             prompt,
-            initialvalue=file_path.stem,
+            initialvalue=base_name,
             parent=self.root,
         )
         if name is None:
             return None
-        return name.strip() or file_path.stem
+        return name.strip() or base_name
 
     def _rename_input_file(self, file_path: Path, new_base: str) -> Optional[Path]:
         new_path = file_path.with_name(f"{new_base}{file_path.suffix}")
@@ -685,6 +690,7 @@ class ConverterUI:
         self.transcript_text.delete("1.0", "end")
         self.timestamp_tags.clear()
         self.timestamp_ranges.clear()
+        self.rendered_segments.clear()
         self.note_tags.clear()
 
         timestamp_re = re.compile(
@@ -703,6 +709,7 @@ class ConverterUI:
                 note_key = self._timestamp_key(seconds)
                 self.timestamp_tags[tag] = seconds
                 self.timestamp_ranges[tag] = (seconds, end_seconds)
+                self.rendered_segments.append((tag, seconds, end_seconds))
                 self.note_tags[note_tag] = note_key
                 self.transcript_text.insert("end", start, (tag,))
                 self.transcript_text.insert("end", f" --> {end}")
@@ -1067,12 +1074,22 @@ class ConverterUI:
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label="Ir a este tiempo", command=lambda: self._on_timestamp_click(tag))
         menu.add_command(label="Eliminar esta seccion", command=lambda: self._confirm_cut_segment(tag))
+        menu.add_command(
+            label="Eliminar desde aqui hasta el final",
+            command=lambda: self._confirm_cut_segment(tag, mode="forward"),
+        )
+        menu.add_command(
+            label="Eliminar desde el inicio hasta aqui",
+            command=lambda: self._confirm_cut_segment(tag, mode="backward"),
+        )
+        menu.add_separator()
+        menu.add_command(label="Eliminar varias secciones...", command=self._open_multi_cut_dialog)
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
 
-    def _confirm_cut_segment(self, tag: str) -> None:
+    def _confirm_cut_segment(self, tag: str, mode: str = "segment") -> None:
         if not self.current_transcript_path:
             self._threadsafe_log("Selecciona un SRT para recortar.")
             return
@@ -1080,6 +1097,14 @@ class ConverterUI:
             self._threadsafe_log("No se pudo obtener el rango del SRT.")
             return
         start, end = self.timestamp_ranges[tag]
+        if mode == "forward":
+            duration = self._current_media_duration()
+            if duration is None:
+                self._threadsafe_log("No se pudo obtener la duracion para recortar hacia adelante.")
+                return
+            end = duration
+        elif mode == "backward":
+            start, end = 0.0, start
         if end <= start:
             self._threadsafe_log("Rango de recorte invalido.")
             return
@@ -1093,80 +1118,264 @@ class ConverterUI:
         )
         if not messagebox.askyesno("Confirmar recorte", prompt):
             return
-        threading.Thread(target=self._cut_segment_worker, args=(start, end), daemon=True).start()
+        self._start_cut_thread([(start, end)])
 
-    def _cut_segment_worker(self, start: float, end: float) -> None:
-        if self.closing or not self.current_transcript_path:
+    def _open_multi_cut_dialog(self) -> None:
+        if not self.current_transcript_path:
+            self._threadsafe_log("Selecciona un SRT para recortar.")
             return
-        transcript_path = self.current_transcript_path
-        delta = end - start
-        if delta <= 0:
-            self._threadsafe_log("Rango de recorte invalido.")
+        segments = parse_srt_segments(self.current_transcript_path)
+        if not segments:
+            self._threadsafe_log("No hay segmentos en el SRT.")
             return
-        self._threadsafe_log(
-            f"Cortando segmento {self._format_seconds_hhmmss(start)} -> {self._format_seconds_hhmmss(end)}..."
-        )
+        window = tk.Toplevel(self.root)
+        window.title("Seleccionar secciones a eliminar")
+        window.geometry("480x420")
+        window.transient(self.root)
+        window.grab_set()
+        listbox = tk.Listbox(window, selectmode="extended")
+        listbox.pack(fill="both", expand=True, padx=10, pady=10)
+        labels: List[Tuple[float, float]] = []
+        for seg in segments:
+            start = seg["start"]
+            end = seg["end"]
+            text = " ".join(seg.get("text", [])).strip()
+            snippet = (text[:60] + "...") if len(text) > 60 else text
+            label = f"{self._format_seconds_hhmmss(start)} - {self._format_seconds_hhmmss(end)} | {snippet}"
+            listbox.insert("end", label)
+            labels.append((start, end))
+
+        btn_frame = ttk.Frame(window)
+        btn_frame.pack(fill="x", padx=10, pady=(0, 10))
+
+        def confirm() -> None:
+            selection = listbox.curselection()
+            if not selection:
+                self._threadsafe_log("No se seleccionaron tramos.")
+                return
+            ranges = [labels[idx] for idx in selection]
+            window.destroy()
+            self._start_cut_thread(ranges)
+
+        ttk.Button(btn_frame, text="Eliminar seleccionados", command=confirm).pack(side="right")
+        ttk.Button(btn_frame, text="Cerrar", command=window.destroy).pack(side="right", padx=(0, 6))
+
+    def _start_cut_thread(self, ranges: List[Tuple[float, float]]) -> None:
+        if self.cutting:
+            self._threadsafe_log("Ya hay un recorte en progreso.")
+            return
+        ranges = self._merged_ranges(ranges)
+        if not ranges:
+            self._threadsafe_log("Rangos de recorte vacios.")
+            return
+        self.cutting = True
+        self._enter_cut_ui()
+        threading.Thread(target=self._cut_segment_worker, args=(ranges,), daemon=True).start()
+
+    def _cut_segment_worker(self, ranges: List[Tuple[float, float]]) -> None:
+        try:
+            if self.closing or not self.current_transcript_path:
+                return
+            transcript_path = self.current_transcript_path
+            duration = self._current_media_duration()
+            if duration is None:
+                self._threadsafe_log("No se pudo obtener la duracion del medio para recortar.")
+                return
+            ranges = self._clamp_ranges(ranges, duration)
+            if not ranges:
+                self._threadsafe_log("Rangos de recorte vacios tras validar.")
+                return
+            label_ranges = "; ".join(
+                f"{self._format_seconds_hhmmss(s)} -> {self._format_seconds_hhmmss(e)}" for s, e in ranges
+            )
+            self._threadsafe_log(f"Cortando tramos: {label_ranges}")
+            self._threadsafe_progress(None, "Recortando...")  # modo indeterminado
+
+            media_info = self._find_media_for_transcript(transcript_path)
+            audio_path = transcript_path.with_suffix(config.AUDIO_EXT)
+            targets: List[Tuple[Path, bool]] = []
+            if media_info:
+                targets.append(media_info)
+            if audio_path.exists() and (not media_info or audio_path != media_info[0]):
+                targets.append((audio_path, False))
+            if not targets:
+                self._threadsafe_log("No se encontro video ni audio para recortar.")
+                return
+
+            keep_intervals = self._build_keep_intervals(duration, ranges)
+            if not keep_intervals:
+                self._threadsafe_log("El recorte eliminaria todo el archivo.")
+                return
+
+            stats_before = self._collect_media_stats(targets)
+            errors: List[str] = []
+            for path, is_video in targets:
+                try:
+                    self._threadsafe_log(f"Recortando {path.name}...")
+                    self._cut_media_segment(path, is_video, keep_intervals)
+                    self._threadsafe_log(f"Recorte aplicado: {path.name}")
+                except Exception as exc:
+                    errors.append(f"{path.name}: {exc}")
+
+            try:
+                self._cut_srt_file(transcript_path, ranges)
+                self._threadsafe_log(f"SRT actualizado: {transcript_path.name}")
+            except Exception as exc:
+                errors.append(f"SRT: {exc}")
+
+            try:
+                self._shift_notes_after_cut(ranges)
+            except Exception as exc:
+                self._threadsafe_log(f"No se pudieron ajustar notas: {exc}")
+
+            stats_after = self._collect_media_stats(targets)
+            self._log_media_deltas(stats_before, stats_after)
+
+            if errors:
+                for msg in errors:
+                    self._threadsafe_log(f"Error recortando: {msg}")
+            else:
+                self._threadsafe_log("Recorte finalizado.")
+
+            self._threadsafe_refresh_transcripts()
+            try:
+                self.root.after(0, self._reload_after_cut)
+            except Exception:
+                pass
+        finally:
+            self._exit_cut_ui()
+
+    def _enter_cut_ui(self) -> None:
         try:
             self.root.after(0, self._stop_playback)
         except Exception:
             pass
-
-        media_info = self._find_media_for_transcript(transcript_path)
-        audio_path = transcript_path.with_suffix(config.AUDIO_EXT)
-        targets: List[Tuple[Path, bool]] = []
-        if media_info:
-            targets.append(media_info)
-        if audio_path.exists() and (not media_info or audio_path != media_info[0]):
-            targets.append((audio_path, False))
-        if not targets:
-            self._threadsafe_log("No se encontro video ni audio para recortar.")
-            return
-
-        errors: List[str] = []
-        for path, is_video in targets:
-            try:
-                self._cut_media_segment(path, is_video, start, end)
-                self._threadsafe_log(f"Recorte aplicado: {path.name}")
-            except Exception as exc:
-                errors.append(f"{path.name}: {exc}")
-
+        self._close_player_window()
         try:
-            self._cut_srt_file(transcript_path, start, end)
-            self._threadsafe_log(f"SRT actualizado: {transcript_path.name}")
-        except Exception as exc:
-            errors.append(f"SRT: {exc}")
+            self.transcript_text.config(state="disabled")
+            self.transcript_list.config(state="disabled")
+        except Exception:
+            pass
+        self._threadsafe_progress(None, "Recortando...")
 
+    def _exit_cut_ui(self) -> None:
+        self.cutting = False
         try:
-            self._shift_notes_after_cut(start, end)
-        except Exception as exc:
-            self._threadsafe_log(f"No se pudieron ajustar notas: {exc}")
-
-        if errors:
-            for msg in errors:
-                self._threadsafe_log(f"Error recortando: {msg}")
-        else:
-            self._threadsafe_log("Recorte finalizado.")
-
-        self._threadsafe_refresh_transcripts()
+            self.transcript_text.config(state="normal")
+            self.transcript_list.config(state="normal")
+        except Exception:
+            pass
         try:
-            self.root.after(0, self._reload_after_cut)
+            self.progress.stop()
+            self.progress_var.set(0.0)
+            self.status_var.set("Listo")
         except Exception:
             pass
 
-    def _cut_media_segment(self, path: Path, is_video: bool, start: float, end: float) -> None:
+    def _current_media_duration(self) -> Optional[float]:
+        media_info = None
+        if self.current_transcript_path:
+            media_info = self._find_media_for_transcript(self.current_transcript_path)
+        if media_info:
+            return get_duration_seconds(media_info[0])
+        if self.current_audio_path:
+            return get_duration_seconds(self.current_audio_path)
+        return None
+
+    def _close_player_window(self) -> None:
+        if self.vlc_player:
+            try:
+                self.vlc_player.stop()
+            except Exception:
+                pass
+        if self.player_window and self.player_window.winfo_exists():
+            try:
+                self.player_window.destroy()
+            except Exception:
+                pass
+
+    def _build_keep_intervals(
+        self, duration: float, ranges: List[Tuple[float, float]]
+    ) -> List[Tuple[float, float]]:
+        merged = self._clamp_ranges(ranges, duration)
+        if not merged:
+            return []
+        keep: List[Tuple[float, float]] = []
+        cursor = 0.0
+        eps = 0.001
+        for start, end in merged:
+            if start - cursor > eps:
+                keep.append((cursor, start))
+            cursor = end
+        if duration - cursor > eps:
+            keep.append((cursor, duration))
+        return [(s, e) for s, e in keep if e - s > eps]
+
+    def _clamp_ranges(self, ranges: List[Tuple[float, float]], duration: float) -> List[Tuple[float, float]]:
+        clamped = []
+        for start, end in ranges:
+            s = max(0.0, min(start, duration))
+            e = max(s, min(end, duration))
+            if e - s > 0.0005:
+                clamped.append((s, e))
+        return self._merged_ranges(clamped)
+
+    def _merged_ranges(self, ranges: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        if not ranges:
+            return []
+        sorted_ranges = sorted(ranges, key=lambda item: item[0])
+        merged: List[Tuple[float, float]] = []
+        cur_start, cur_end = sorted_ranges[0]
+        for start, end in sorted_ranges[1:]:
+            if start <= cur_end + 0.0005:
+                cur_end = max(cur_end, end)
+            else:
+                merged.append((cur_start, cur_end))
+                cur_start, cur_end = start, end
+        merged.append((cur_start, cur_end))
+        return merged
+
+    def _collect_media_stats(self, targets: List[Tuple[Path, bool]]) -> Dict[str, Dict[str, float]]:
+        stats: Dict[str, Dict[str, float]] = {}
+        for path, _is_video in targets:
+            stats[str(path)] = {
+                "duration": get_duration_seconds(path) or 0.0,
+                "size": float(path.stat().st_size) if path.exists() else 0.0,
+            }
+        return stats
+
+    def _log_media_deltas(
+        self, before: Dict[str, Dict[str, float]], after: Dict[str, Dict[str, float]]
+    ) -> None:
+        for key, pre in before.items():
+            post = after.get(key, {"duration": 0.0, "size": 0.0})
+            dur_before = pre.get("duration", 0.0)
+            dur_after = post.get("duration", 0.0)
+            size_before = pre.get("size", 0.0)
+            size_after = post.get("size", 0.0)
+            self._threadsafe_log(
+                f"{Path(key).name}: duracion {self._format_seconds_hhmmss(dur_before)} -> {self._format_seconds_hhmmss(dur_after)}, "
+                f"peso {self._format_size(size_before)} -> {self._format_size(size_after)}"
+            )
+
+    def _format_size(self, size_bytes: float) -> str:
+        if size_bytes <= 0:
+            return "0 B"
+        units = ["B", "KB", "MB", "GB"]
+        size = size_bytes
+        unit = units[0]
+        for u in units:
+            unit = u
+            if size < 1024:
+                break
+            size /= 1024
+        return f"{size:.1f} {unit}"
+
+    def _cut_media_segment(
+        self, path: Path, is_video: bool, keep_intervals: List[Tuple[float, float]]
+    ) -> None:
         if shutil.which("ffmpeg") is None:
             raise RuntimeError("ffmpeg no esta instalado o no se encuentra en PATH.")
-
-        duration = get_duration_seconds(path)
-        safe_start = max(0.0, start)
-        safe_end = max(safe_start, end)
-        if duration:
-            safe_start = min(safe_start, duration)
-            safe_end = min(safe_end, duration)
-            if safe_start >= safe_end:
-                raise RuntimeError("Rango de recorte fuera de los limites del archivo.")
-            if safe_end - safe_start >= duration - 0.05:
-                raise RuntimeError("El rango eliminaria todo el archivo.")
 
         temp_path = path.with_name(f"{path.stem}.tmp{path.suffix}")
         backup_path = path.with_suffix(path.suffix + ".bak")
@@ -1179,43 +1388,34 @@ class ConverterUI:
         if not has_video and not has_audio:
             raise RuntimeError("No se encontraron streams en el archivo.")
 
-        cut_front = safe_start <= 0.05
-        cut_tail = duration is not None and (duration - safe_end) <= 0.05
         filter_parts: List[str] = []
         map_parts: List[str] = []
         audio_codec = self._audio_codec_for_ext(path)
+        eps = 0.0005
+        keep = [(s, e) for s, e in keep_intervals if e - s > eps]
+        if not keep:
+            raise RuntimeError("El recorte eliminaria todo el archivo.")
 
-        if cut_front:
-            if has_video:
-                filter_parts.append(f"[0:v]trim={safe_end},setpts=PTS-STARTPTS[v_keep]")
-                map_parts.extend(["-map", "[v_keep]"])
-            if has_audio:
-                filter_parts.append(f"[0:a]atrim={safe_end},asetpts=PTS-STARTPTS[a_keep]")
-                map_parts.extend(["-map", "[a_keep]"])
-        elif cut_tail:
-            if has_video:
-                filter_parts.append(f"[0:v]trim=0:{safe_start},setpts=PTS-STARTPTS[v_keep]")
-                map_parts.extend(["-map", "[v_keep]"])
-            if has_audio:
-                filter_parts.append(f"[0:a]atrim=0:{safe_start},asetpts=PTS-STARTPTS[a_keep]")
-                map_parts.extend(["-map", "[a_keep]"])
+        if has_video:
+            for idx, (s, e) in enumerate(keep):
+                filter_parts.append(f"[0:v]trim={s}:{e},setpts=PTS-STARTPTS[v{idx}]")
+        if has_audio:
+            for idx, (s, e) in enumerate(keep):
+                filter_parts.append(f"[0:a]atrim={s}:{e},asetpts=PTS-STARTPTS[a{idx}]")
+
+        keep_count = len(keep)
+        if has_video and has_audio:
+            concat_inputs = "".join(f"[v{i}][a{i}]" for i in range(keep_count))
+            filter_parts.append(f"{concat_inputs}concat=n={keep_count}:v=1:a=1[outv][outa]")
+            map_parts.extend(["-map", "[outv]", "-map", "[outa]"])
+        elif has_video:
+            concat_inputs = "".join(f"[v{i}]" for i in range(keep_count))
+            filter_parts.append(f"{concat_inputs}concat=n={keep_count}:v=1[outv]")
+            map_parts.extend(["-map", "[outv]"])
         else:
-            if has_video:
-                filter_parts.append(f"[0:v]trim=0:{safe_start},setpts=PTS-STARTPTS[v0]")
-                filter_parts.append(f"[0:v]trim={safe_end},setpts=PTS-STARTPTS[v1]")
-            if has_audio:
-                filter_parts.append(f"[0:a]atrim=0:{safe_start},asetpts=PTS-STARTPTS[a0]")
-                filter_parts.append(f"[0:a]atrim={safe_end},asetpts=PTS-STARTPTS[a1]")
-
-            if has_video and has_audio:
-                filter_parts.append("[v0][a0][v1][a1]concat=n=2:v=1:a=1[outv][outa]")
-                map_parts.extend(["-map", "[outv]", "-map", "[outa]"])
-            elif has_video:
-                filter_parts.append("[v0][v1]concat=n=2:v=1[outv]")
-                map_parts.extend(["-map", "[outv]"])
-            else:
-                filter_parts.append("[a0][a1]concat=n=2:v=0:a=1[outa]")
-                map_parts.extend(["-map", "[outa]"])
+            concat_inputs = "".join(f"[a{i}]" for i in range(keep_count))
+            filter_parts.append(f"{concat_inputs}concat=n={keep_count}:v=0:a=1[outa]")
+            map_parts.extend(["-map", "[outa]"])
 
         cmd: List[str] = ["ffmpeg", "-y", "-i", str(path)]
         if filter_parts:
@@ -1308,22 +1508,32 @@ class ConverterUI:
             return "adts"
         return None
 
-    def _cut_srt_file(self, path: Path, start: float, end: float) -> None:
+    def _cut_srt_file(self, path: Path, ranges: List[Tuple[float, float]]) -> None:
         segments = parse_srt_segments(path)
         if not segments:
             raise RuntimeError("SRT vacio.")
-        delta = end - start
+        merged = self._merged_ranges(ranges)
         eps = 0.001
         new_segments: List[Tuple[float, float, List[str]]] = []
         for segment in segments:
             seg_start = segment["start"]
             seg_end = segment["end"]
-            if seg_end <= start + eps:
-                new_segments.append((seg_start, seg_end, segment["text"]))
-            elif seg_start >= end - eps:
-                new_segments.append((seg_start - delta, seg_end - delta, segment["text"]))
+            # shift acumulado antes del inicio del segmento
+            shift = sum(e - s for s, e in merged if e <= seg_start)
+            overlap = None
+            for s, e in merged:
+                if seg_start < e and seg_end > s:
+                    overlap = s
+                    break
+            if overlap is None:
+                new_segments.append((seg_start - shift, seg_end - shift, segment["text"]))
             else:
-                continue
+                if seg_start >= overlap - eps:
+                    continue
+                new_end = max(seg_start, overlap) - shift
+                new_start = seg_start - shift
+                if new_end - new_start > eps:
+                    new_segments.append((new_start, new_end, segment["text"]))
 
         if not new_segments:
             raise RuntimeError("El recorte eliminaria todo el SRT.")
@@ -1350,9 +1560,9 @@ class ConverterUI:
         millis = int(round((value - int(value)) * 1000))
         return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
 
-    def _shift_notes_after_cut(self, start: float, end: float) -> None:
-        delta = end - start
-        if delta <= 0:
+    def _shift_notes_after_cut(self, ranges: List[Tuple[float, float]]) -> None:
+        merged = self._merged_ranges(ranges)
+        if not merged:
             return
         self._load_annotations()
         if not self.annotations:
@@ -1364,11 +1574,17 @@ class ConverterUI:
                 ts = float(key)
             except (TypeError, ValueError):
                 continue
-            if start - eps <= ts <= end + eps:
+            inside = False
+            shift = 0.0
+            for s, e in merged:
+                if s - eps <= ts <= e + eps:
+                    inside = True
+                    break
+                if e <= ts:
+                    shift += e - s
+            if inside:
                 continue
-            if ts > end:
-                ts -= delta
-            updated[self._timestamp_key(ts)] = text
+            updated[self._timestamp_key(ts - shift)] = text
         self.annotations = updated
         self._save_annotations()
 
@@ -1817,7 +2033,22 @@ class ConverterUI:
             self.progress["value"] = value
 
     def _log(self, message: str) -> None:
+        message = self._format_log_message(message)
         self.log_text.config(state="normal")
         self.log_text.insert("end", f"{message}\n")
         self.log_text.see("end")
         self.log_text.config(state="disabled")
+
+    def _format_log_message(self, message: str) -> str:
+        lower = message.lower()
+        if "error" in lower or "fallo" in lower or "no se pudo" in lower:
+            icon = "✖️ "
+        elif "listo" in lower or "complet" in lower or "aplicado" in lower or "guardado" in lower:
+            icon = "✅ "
+        elif "cortando" in lower or "recort" in lower or "proces" in lower:
+            icon = "✂️ "
+        elif "vigil" in lower or "espera" in lower:
+            icon = "👀 "
+        else:
+            icon = "ℹ️ "
+        return f"{icon}{message}"
