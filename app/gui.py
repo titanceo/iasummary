@@ -99,6 +99,7 @@ class ConverterUI:
         menubar = tk.Menu(self.root)
         settings_menu = tk.Menu(menubar, tearoff=0)
         settings_menu.add_command(label="Configuracion...", command=self._open_settings_window)
+        settings_menu.add_command(label="Calcular espacio", command=self._show_space_usage)
         menubar.add_cascade(label="Configuracion", menu=settings_menu)
         self.root.config(menu=menubar)
 
@@ -156,9 +157,13 @@ class ConverterUI:
         ttk.Label(search_frame, text="Buscar:").pack(side="left")
         search_entry = ttk.Entry(search_frame, textvariable=self.search_var)
         search_entry.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        ttk.Button(search_frame, text="Eliminar backups", command=self._delete_selected_backups).pack(
+            side="right", padx=(6, 0)
+        )
         self.transcript_list = tk.Listbox(self.list_frame, height=10)
         self.transcript_list.pack(fill="both", expand=True)
         self.transcript_list.bind("<<ListboxSelect>>", self._show_transcript)
+        self.transcript_list.bind("<Button-3>", self._on_transcript_context)
 
         notebook = ttk.Notebook(right_frame)
         notebook.pack(fill="both", expand=True, padx=10, pady=10)
@@ -629,6 +634,22 @@ class ConverterUI:
         except OSError:
             return "desconocido"
 
+    def _backup_paths_for_transcript(self, transcript_path: Path) -> List[Path]:
+        paths: List[Path] = []
+        # transcript bak
+        paths.append(transcript_path.with_suffix(transcript_path.suffix + ".bak"))
+        # audio bak
+        audio_path = transcript_path.with_suffix(config.AUDIO_EXT)
+        paths.append(audio_path.with_suffix(audio_path.suffix + ".bak"))
+        # video baks
+        for ext in config.VIDEO_EXTENSIONS:
+            candidate = transcript_path.with_suffix(ext)
+            paths.append(candidate.with_suffix(candidate.suffix + ".bak"))
+        return paths
+
+    def _has_backups(self, transcript_path: Path) -> bool:
+        return any(path.exists() for path in self._backup_paths_for_transcript(transcript_path))
+
     def _refresh_transcripts(self) -> None:
         directory = Path(self.directory_var.get()).expanduser()
         if not directory.exists():
@@ -651,7 +672,73 @@ class ConverterUI:
         self.transcript_list.delete(0, "end")
         for path in self.filtered_transcripts:
             created_label = self._format_created_at(path)
-            self.transcript_list.insert("end", f"{created_label} - {path.name}")
+            icon = "🗂️" if self._has_backups(path) else "📝"
+            self.transcript_list.insert("end", f"{icon} {created_label} - {path.name}")
+
+    def _delete_selected_backups(self) -> None:
+        selection = self.transcript_list.curselection()
+        if not selection:
+            self._threadsafe_log("Selecciona un SRT para eliminar backups.")
+            return
+        paths = [self.filtered_transcripts[idx] for idx in selection if idx < len(self.filtered_transcripts)]
+        if not paths:
+            return
+        for transcript_path in paths:
+            deleted = []
+            for backup in self._backup_paths_for_transcript(transcript_path):
+                if backup.exists():
+                    try:
+                        backup.unlink()
+                        deleted.append(backup.name)
+                    except Exception as exc:
+                        self._threadsafe_log(f"No se pudo eliminar {backup.name}: {exc}")
+            if deleted:
+                self._threadsafe_log(f"Backups eliminados: {', '.join(deleted)}")
+        self._threadsafe_refresh_transcripts()
+
+    def _on_transcript_context(self, event: tk.Event) -> None:
+        if self.cutting:
+            return
+        idx = self.transcript_list.nearest(event.y)
+        if idx < 0 or idx >= len(self.filtered_transcripts):
+            return
+        self.transcript_list.selection_clear(0, "end")
+        self.transcript_list.selection_set(idx)
+        transcript_path = self.filtered_transcripts[idx]
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="Abrir", command=lambda: self._show_transcript_at_index(idx))
+        menu.add_command(
+            label="Eliminar backups de este SRT",
+            command=lambda: self._delete_backups_for_path(transcript_path),
+        )
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _show_transcript_at_index(self, idx: int) -> None:
+        try:
+            self.transcript_list.selection_clear(0, "end")
+            self.transcript_list.selection_set(idx)
+            self.transcript_list.event_generate("<<ListboxSelect>>")
+        except Exception:
+            pass
+
+    def _delete_backups_for_path(self, transcript_path: Path) -> None:
+        if not self._has_backups(transcript_path):
+            self._threadsafe_log("No hay backups para eliminar.")
+            return
+        deleted = []
+        for backup in self._backup_paths_for_transcript(transcript_path):
+            if backup.exists():
+                try:
+                    backup.unlink()
+                    deleted.append(backup.name)
+                except Exception as exc:
+                    self._threadsafe_log(f"No se pudo eliminar {backup.name}: {exc}")
+        if deleted:
+            self._threadsafe_log(f"Backups eliminados: {', '.join(deleted)}")
+        self._threadsafe_refresh_transcripts()
 
     def _threadsafe_refresh_transcripts(self) -> None:
         if self.closing:
@@ -1060,6 +1147,8 @@ class ConverterUI:
             self.vlc_player.set_time(current_time)
 
     def _on_timestamp_click(self, tag: str) -> None:
+        if self.cutting:
+            return
         seconds = self.timestamp_tags.get(tag)
         if seconds is None:
             return
@@ -1070,6 +1159,8 @@ class ConverterUI:
 
     def _on_timestamp_context(self, event: tk.Event, tag: str) -> None:
         if self.closing:
+            return
+        if self.cutting:
             return
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label="Ir a este tiempo", command=lambda: self._on_timestamp_click(tag))
@@ -1124,15 +1215,25 @@ class ConverterUI:
         if not self.current_transcript_path:
             self._threadsafe_log("Selecciona un SRT para recortar.")
             return
+        if self.cutting:
+            self._threadsafe_log("Espera a que termine el recorte actual.")
+            return
         segments = parse_srt_segments(self.current_transcript_path)
         if not segments:
             self._threadsafe_log("No hay segmentos en el SRT.")
             return
         window = tk.Toplevel(self.root)
         window.title("Seleccionar secciones a eliminar")
-        window.geometry("480x420")
+        width, height = 480, 420
+        window.geometry(f"{width}x{height}")
         window.transient(self.root)
         window.grab_set()
+        self.root.update_idletasks()
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        x = max(0, screen_w - width - 20)
+        y = max(0, screen_h - height - 60)
+        window.geometry(f"+{x}+{y}")
         listbox = tk.Listbox(window, selectmode="extended")
         listbox.pack(fill="both", expand=True, padx=10, pady=10)
         labels: List[Tuple[float, float]] = []
@@ -1256,7 +1357,8 @@ class ConverterUI:
             self.transcript_list.config(state="disabled")
         except Exception:
             pass
-        self._threadsafe_progress(None, "Recortando...")
+        self.status_var.set("Procesando recorte...")
+        self._threadsafe_progress(None, "Procesando recorte...")
 
     def _exit_cut_ui(self) -> None:
         self.cutting = False
@@ -1370,6 +1472,75 @@ class ConverterUI:
                 break
             size /= 1024
         return f"{size:.1f} {unit}"
+
+    def _show_space_usage(self) -> None:
+        root = Path(self.directory_var.get()).expanduser()
+        if not root.exists():
+            self._threadsafe_log(f"Carpeta no encontrada: {root}")
+            return
+        usage = self._compute_space_usage(root)
+        window = tk.Toplevel(self.root)
+        window.title("Uso de espacio")
+        width, height = 420, 360
+        window.geometry(f"{width}x{height}")
+        window.transient(self.root)
+        window.grab_set()
+        self.root.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - width) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - height) // 2
+        window.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+        frame = ttk.Frame(window, padding=12)
+        frame.pack(fill="both", expand=True)
+        lines = [
+            "ARCHIVOS:",
+            f"- SRT: {self._format_size(usage['srt'])}",
+            f"- Audios: {self._format_size(usage['audio'])}",
+            f"- Videos: {self._format_size(usage['video'])}",
+            f"Total: {self._format_size(usage['srt'] + usage['audio'] + usage['video'])}",
+            "",
+            "BACKUPS:",
+            f"- SRT .bak: {self._format_size(usage['srt_bak'])}",
+            f"- Audios .bak: {self._format_size(usage['audio_bak'])}",
+            f"- Videos .bak: {self._format_size(usage['video_bak'])}",
+            f"Total backups: {self._format_size(usage['srt_bak'] + usage['audio_bak'] + usage['video_bak'])}",
+        ]
+        txt = tk.Text(frame, wrap="word", state="normal", height=12)
+        txt.insert("end", "\n".join(lines))
+        txt.config(state="disabled")
+        txt.pack(fill="both", expand=True)
+        ttk.Button(frame, text="Cerrar", command=window.destroy).pack(pady=(8, 0))
+
+    def _compute_space_usage(self, root: Path) -> Dict[str, float]:
+        def sum_files(paths: Iterable[Path]) -> float:
+            total = 0.0
+            for p in paths:
+                try:
+                    if p.is_file():
+                        total += float(p.stat().st_size)
+                except OSError:
+                    continue
+            return total
+
+        srt = sum_files(root.glob(f"*{config.TRANSCRIPT_EXT}"))
+        srt_bak = sum_files(root.glob(f"*{config.TRANSCRIPT_EXT}.bak"))
+        audio = sum_files(root.glob(f"*{config.AUDIO_EXT}"))
+        audio_bak = sum_files(root.glob(f"*{config.AUDIO_EXT}.bak"))
+
+        video = 0.0
+        video_bak = 0.0
+        for ext in config.VIDEO_EXTENSIONS:
+            video += sum_files(root.glob(f"*{ext}"))
+            video_bak += sum_files(root.glob(f"*{ext}.bak"))
+
+        return {
+            "srt": srt,
+            "audio": audio,
+            "video": video,
+            "srt_bak": srt_bak,
+            "audio_bak": audio_bak,
+            "video_bak": video_bak,
+        }
 
     def _cut_media_segment(
         self, path: Path, is_video: bool, keep_intervals: List[Tuple[float, float]]
@@ -2021,6 +2192,8 @@ class ConverterUI:
             pass
 
     def _update_progress_ui(self, value: Optional[float], message: str) -> None:
+        if self.cutting:
+            message = "Procesando recorte..."
         self.status_var.set(message)
         if value is None:
             self.progress.config(mode="indeterminate")
@@ -2041,7 +2214,9 @@ class ConverterUI:
 
     def _format_log_message(self, message: str) -> str:
         lower = message.lower()
-        if "error" in lower or "fallo" in lower or "no se pudo" in lower:
+        if "transcripcion lista" in lower:
+            icon = "📖 "
+        elif "error" in lower or "fallo" in lower or "no se pudo" in lower:
             icon = "✖️ "
         elif "listo" in lower or "complet" in lower or "aplicado" in lower or "guardado" in lower:
             icon = "✅ "
